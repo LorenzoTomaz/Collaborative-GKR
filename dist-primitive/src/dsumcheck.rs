@@ -104,8 +104,8 @@ pub async fn d_sumcheck<F: FftField, Net: MPCSerializeNet>(
     let mut last_round = shares.clone();
     for i in 0..N {
         let parts = last_round.split_at(last_round.len() / 2);
-        let res1 = parts.0.iter().sum();
-        let res2 = parts.1.iter().sum();
+        let res1 = d_sum(parts.0.iter().sum(), pp, net, sid).await?;
+        let res2 = d_sum(parts.1.iter().sum(), pp, net, sid).await?;
         result.push((res1, res2));
         // result.push((parts.0.iter().sum(), parts.1.iter().sum()));
         let this_round = parts
@@ -119,8 +119,16 @@ pub async fn d_sumcheck<F: FftField, Net: MPCSerializeNet>(
     debug_assert!(last_round.len() == 1);
     let mut last_share = last_round[0];
     for i in 0..L {
-        let res1 = last_share;
-        let res2 = last_share;
+        let mask0 = vec![1; 1 << (L - i - 1)]
+            .into_iter()
+            .chain(vec![0; 1 << (L - i - 1)].into_iter())
+            .collect();
+        let mask1 = vec![0; 1 << (L - i - 1)]
+            .into_iter()
+            .chain(vec![1; 1 << (L - i - 1)].into_iter())
+            .collect();
+        let res1 = d_sum_masked(last_share, &mask0, pp, net, sid).await?;
+        let res2 = d_sum_masked(last_share, &mask1, pp, net, sid).await?;
         result.push((res1, res2));
         let permutation = (1 << (L - i - 1)..1 << (L - i))
             .chain(0..1 << (L - i - 1))
@@ -131,7 +139,7 @@ pub async fn d_sumcheck<F: FftField, Net: MPCSerializeNet>(
     }
     result.push((
         F::ZERO,
-        last_share,
+        d_sum_masked(last_share, &vec![1], pp, net, sid).await?,
     ));
     end_timer!(d_sumcheck_timer);
     Ok(result)
@@ -160,7 +168,7 @@ pub async fn d_sumcheck_product<F: FftField, Net: MPCSerializeNet>(
         let parts_g = last_round_g.split_at(last_round_g.len() / 2);
         let res = {
             // t=0
-            let part0_sum = degree_reduce(
+            let part0_sum = d_sum2(
                 parts_f
                     .0
                     .iter()
@@ -171,7 +179,7 @@ pub async fn d_sumcheck_product<F: FftField, Net: MPCSerializeNet>(
                 sid,
             );
             //t=1
-            let part1_sum = degree_reduce(
+            let part1_sum = d_sum2(
                 parts_f
                     .1
                     .iter()
@@ -196,7 +204,7 @@ pub async fn d_sumcheck_product<F: FftField, Net: MPCSerializeNet>(
                 .zip(parts_g.1.iter())
                 .map(|(x, y)| -*x + *y * F::from(2_u64))
                 .collect();
-            let part2_sum = degree_reduce(
+            let part2_sum = d_sum2(
                 part2_f
                     .iter()
                     .zip(part2_g.iter())
@@ -228,6 +236,17 @@ pub async fn d_sumcheck_product<F: FftField, Net: MPCSerializeNet>(
     let mut last_share_g = last_round_g[0];
     // Now we go into shares. The general logic is the same. The only difference being that we now do the computation using permutation.
     for i in 0..L {
+        // The tail part of the shares are all garbage. Filter them with a mask
+        // mask: 1 1 | 0 0 | 0 0 0 0
+        let mask0 = vec![1; 1 << (L - i - 1)]
+            .into_iter()
+            .chain(vec![0; 1 << (L - i - 1)].into_iter())
+            .collect();
+        // mask: 0 0 | 1 1 | 0 0 0 0
+        let mask1 = vec![0; 1 << (L - i - 1)]
+            .into_iter()
+            .chain(vec![1; 1 << (L - i - 1)].into_iter())
+            .collect();
         // The permutation "swap" the first half and the second half in the valid range. The invalid garbage is untouched.
         // permutation: 2 3 | 0 1 | 4 5 6 7
         let permutation = (1 << (L - i - 1)..1 << (L - i))
@@ -253,15 +272,17 @@ pub async fn d_sumcheck_product<F: FftField, Net: MPCSerializeNet>(
         .await?;
         let res = {
             // t=0
-            let part0_sum = degree_reduce(
+            let part0_sum = d_sum2_masked(
                 last_share_f * last_share_g,
+                &mask0,
                 pp,
                 net,
                 MultiplexedStreamID::Zero,
             );
             // t=1
-            let part1_sum = degree_reduce(
+            let part1_sum = d_sum2_masked(
                 last_share_f * last_share_g,
+                &mask1,
                 pp,
                 net,
                 MultiplexedStreamID::One,
@@ -270,7 +291,7 @@ pub async fn d_sumcheck_product<F: FftField, Net: MPCSerializeNet>(
             let part2_f = -last_share_f + this_share_f * F::from(2_u64);
             let part2_g = -last_share_g + this_share_g * F::from(2_u64);
             let part2_sum =
-                degree_reduce(part2_f * part2_g,  pp, net, MultiplexedStreamID::Two);
+                d_sum2_masked(part2_f * part2_g, &mask0, pp, net, MultiplexedStreamID::Two);
             // Since the s_sum2_masked already handles the degree, no degree_reduce needed.
             try_join3(part0_sum, part1_sum, part2_sum).await?
         };
@@ -282,7 +303,7 @@ pub async fn d_sumcheck_product<F: FftField, Net: MPCSerializeNet>(
     // Put it in the second slot to keep consistency with vec.split_at(vec.len()/2). In which case the first part will be empty.
     result.push((
         F::ZERO,
-        degree_reduce(last_share_f * last_share_g, &pp, net, sid).await?,
+        d_sum2_masked(last_share_f * last_share_g, &vec![1], pp, net, sid).await?,
         F::ZERO,
     ));
     Ok(result)
@@ -554,7 +575,7 @@ mod tests {
         true
     }
 
-    /// Simulate the distributed sumcheck, but do not actually distribute the shares
+    /// Simulate the shared sumcheck, but do not actually distribute the shares
     #[tokio::test]
     async fn dsumcheck_local_test() {
         let pp = PackedSharingParams::<Fr>::new(L);
